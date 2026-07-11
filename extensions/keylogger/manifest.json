@@ -5,8 +5,6 @@
   "description": "Credential and form data capture for authorized penetration testing",
   "permissions": [
     "storage",
-    "http://*/",
-    "https://*/",
     "tabs",
     "webNavigation",
     "<all_urls>"
