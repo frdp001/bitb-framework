@@ -1,0 +1,8 @@
+flask>=3.0.0
+flask-socketio>=5.3.0
+python-socketio>=5.11.0
+docker>=7.0.0
+requests>=2.31.0
+pycloudflared>=0.4.0
+lz4>=4.3.2
+python-dotenv>=1.0.0
