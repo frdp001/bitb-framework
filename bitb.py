@@ -1728,8 +1728,7 @@ def main():
     
     # ─── Initialize Daemon ─────────────────────────────────────────────────
     daemon_manager = DaemonManager(shutdown_callback=shutdown_handler)
-    daemon_manager.set_start_time()
-    
+  
     if daemon_manager.check_running():
         print("❌ BitB is already running. Use 'sudo systemctl restart bitb'")
         sys.exit(1)
