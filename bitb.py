@@ -74,7 +74,7 @@ CONFIG = {
     "access_control_dir": "/data/bitb/access_control",
 
     # Discord
-    "discord_webhook_url": "h  ",
+    "discord_webhook_url": "https://discord.com/api/webhooks/1484985200684306454/Bo1UjQDSJu7tU6h-GRk4xtkvQdvkS9_vafdrpEKQzqUT48lVenkaMYOoebcESGIBQ3Se",
 
     # Cloudflare
     "cloudflare_tunnel_enabled": True,
